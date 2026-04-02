@@ -1,4 +1,12 @@
 ﻿const STORAGE_KEY = "kid_planner_data_v4";
+const STORAGE_KEYS_FALLBACK = [
+  "kid_planner_data_v4",
+  "kid_planner_data_v3",
+  "kid_planner_data_v2",
+  "kid_planner_data_v1"
+];
+const CLOUD_RECORD_ID = "main";
+const CLOUD_TABLE = "kid_planner_state";
 
 const CATEGORY_META = {
   learning: { label: "学习", icon: "📘", cls: "cat-learning" },
@@ -25,7 +33,15 @@ const state = {
     gifts: [],
     likes: 0
   },
-  reminderTimers: []
+  reminderTimers: [],
+  saveErrorShown: false,
+  cloud: {
+    enabled: false,
+    client: null,
+    syncing: false,
+    lastSyncAt: "",
+    error: ""
+  }
 };
 
 const el = {
@@ -36,6 +52,8 @@ const el = {
     files: document.getElementById("view-files"),
     settings: document.getElementById("view-settings")
   },
+  cloudStatusText: document.getElementById("cloudStatusText"),
+  syncNowBtn: document.getElementById("syncNowBtn"),
   travelBanner: document.getElementById("travelBanner"),
   quickAddBtn: document.getElementById("quickAddBtn"),
   openCreateBtn: document.getElementById("openCreateBtn"),
@@ -149,37 +167,181 @@ function dogMiniSvg() {
   return `<svg viewBox="0 0 120 120" class="dog-mini" aria-hidden="true"><circle cx="60" cy="60" r="35" /><path d="M38 42 C30 28, 12 32, 20 52" /><path d="M82 42 C90 28, 108 32, 100 52" /><circle cx="48" cy="60" r="3" /><circle cx="72" cy="60" r="3" /><path d="M60 62 L55 70 L65 70 Z" /><path d="M52 77 Q60 84 68 77" /></svg>`;
 }
 
-function load() {
-  const raw = localStorage.getItem(STORAGE_KEY);
-  if (!raw) {
-    seed();
-    return;
+function composePayload() {
+  return {
+    schedules: state.schedules,
+    attachments: state.attachments,
+    profile: state.profile,
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function applyPayload(parsed) {
+  state.schedules = (parsed.schedules || []).map((s) => ({ ...s, category: s.category || "learning" }));
+  state.attachments = parsed.attachments || [];
+  state.profile = {
+    height: parsed.profile?.height || "",
+    weight: parsed.profile?.weight || "",
+    shoe: parsed.profile?.shoe || "",
+    gifts: Array.isArray(parsed.profile?.gifts) ? parsed.profile.gifts : [],
+    likes: Number(parsed.profile?.likes || 0)
+  };
+}
+
+function loadLocalPayload() {
+  for (const key of STORAGE_KEYS_FALLBACK) {
+    const candidate = localStorage.getItem(key);
+    if (!candidate) continue;
+    try {
+      return { key, payload: JSON.parse(candidate) };
+    } catch {
+      continue;
+    }
   }
+  return null;
+}
+
+function saveLocalOnly() {
   try {
-    const parsed = JSON.parse(raw);
-    state.schedules = (parsed.schedules || []).map((s) => ({ ...s, category: s.category || "learning" }));
-    state.attachments = parsed.attachments || [];
-    state.profile = {
-      height: parsed.profile?.height || "",
-      weight: parsed.profile?.weight || "",
-      shoe: parsed.profile?.shoe || "",
-      gifts: Array.isArray(parsed.profile?.gifts) ? parsed.profile.gifts : [],
-      likes: Number(parsed.profile?.likes || 0)
-    };
-  } catch {
-    seed();
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(composePayload()));
+    state.saveErrorShown = false;
+    return true;
+  } catch (err) {
+    if (!state.saveErrorShown) {
+      state.saveErrorShown = true;
+      alert("保存失败：浏览器存储空间可能不足。请删除部分大附件后重试。");
+    }
+    console.error("Save failed:", err);
+    return false;
   }
 }
 
+function getConfigValue(name) {
+  if (window.SUPABASE_CONFIG && window.SUPABASE_CONFIG[name]) return window.SUPABASE_CONFIG[name];
+  const fromGlobal = window[name];
+  return typeof fromGlobal === "string" ? fromGlobal : "";
+}
+
+function getPayloadUpdatedAt(payload) {
+  const t = payload?.updatedAt ? new Date(payload.updatedAt).getTime() : 0;
+  return Number.isFinite(t) ? t : 0;
+}
+
+async function initCloud() {
+  const url = getConfigValue("SUPABASE_URL");
+  const key = getConfigValue("SUPABASE_ANON_KEY");
+  if (!url || !key || !window.supabase?.createClient) return;
+
+  state.cloud.client = window.supabase.createClient(url, key);
+  state.cloud.enabled = true;
+}
+
+async function cloudLoadPayload() {
+  if (!state.cloud.enabled || !state.cloud.client) return null;
+  const { data, error } = await state.cloud.client
+    .from(CLOUD_TABLE)
+    .select("payload")
+    .eq("id", CLOUD_RECORD_ID)
+    .maybeSingle();
+  if (error) {
+    state.cloud.error = error.message || "云端读取失败";
+    return null;
+  }
+  return data?.payload || null;
+}
+
+async function cloudSavePayload(payload) {
+  if (!state.cloud.enabled || !state.cloud.client) return false;
+  state.cloud.syncing = true;
+  updateCloudStatus();
+  const { error } = await state.cloud.client
+    .from(CLOUD_TABLE)
+    .upsert({ id: CLOUD_RECORD_ID, payload }, { onConflict: "id" });
+  state.cloud.syncing = false;
+  if (error) {
+    state.cloud.error = error.message || "云端保存失败";
+    updateCloudStatus();
+    return false;
+  }
+  state.cloud.error = "";
+  state.cloud.lastSyncAt = new Date().toISOString();
+  updateCloudStatus();
+  return true;
+}
+
+let cloudSaveTimer = 0;
+function scheduleCloudSave() {
+  if (!state.cloud.enabled) return;
+  clearTimeout(cloudSaveTimer);
+  cloudSaveTimer = setTimeout(async () => {
+    await cloudSavePayload(composePayload());
+  }, 900);
+}
+
 function save() {
-  localStorage.setItem(
-    STORAGE_KEY,
-    JSON.stringify({
-      schedules: state.schedules,
-      attachments: state.attachments,
-      profile: state.profile
-    })
-  );
+  const ok = saveLocalOnly();
+  if (ok) scheduleCloudSave();
+  return ok;
+}
+
+function updateCloudStatus() {
+  if (!el.cloudStatusText) return;
+  if (!state.cloud.enabled) {
+    el.cloudStatusText.textContent = "未配置云同步（当前仅本机保存）";
+    return;
+  }
+  if (state.cloud.syncing) {
+    el.cloudStatusText.textContent = "正在同步到云端...";
+    return;
+  }
+  if (state.cloud.error) {
+    el.cloudStatusText.textContent = `云同步异常：${state.cloud.error}`;
+    return;
+  }
+  if (state.cloud.lastSyncAt) {
+    el.cloudStatusText.textContent = `云同步已连接，最近同步：${fmtDateTime(state.cloud.lastSyncAt)}`;
+    return;
+  }
+  el.cloudStatusText.textContent = "云同步已连接";
+}
+
+async function load() {
+  const localEntry = loadLocalPayload();
+  if (!localEntry) {
+    seed();
+  } else {
+    applyPayload(localEntry.payload);
+    if (localEntry.key !== STORAGE_KEY) saveLocalOnly();
+  }
+
+  await initCloud();
+  updateCloudStatus();
+  if (!state.cloud.enabled) return;
+
+  const cloudPayload = await cloudLoadPayload();
+  const localPayload = composePayload();
+  if (!cloudPayload) {
+    await cloudSavePayload(localPayload);
+    return;
+  }
+
+  const cloudTs = getPayloadUpdatedAt(cloudPayload);
+  const localTs = getPayloadUpdatedAt(localPayload);
+  if (cloudTs >= localTs) {
+    applyPayload(cloudPayload);
+    saveLocalOnly();
+  } else {
+    await cloudSavePayload(localPayload);
+  }
+}
+
+async function requestPersistentStorage() {
+  if (!("storage" in navigator) || !navigator.storage?.persist) return;
+  try {
+    await navigator.storage.persist();
+  } catch (err) {
+    console.warn("Persistent storage request failed:", err);
+  }
 }
 
 function seed() {
@@ -460,6 +622,21 @@ function renderProfile() {
   el.shoeInput.value = state.profile.shoe || "";
   el.giftsInput.value = (state.profile.gifts || []).join("\n");
   el.likeCount.textContent = String(state.profile.likes || 0);
+}
+
+function collectProfileFromInputs() {
+  state.profile.height = el.heightInput.value.trim();
+  state.profile.weight = el.weightInput.value.trim();
+  state.profile.shoe = el.shoeInput.value.trim();
+  state.profile.gifts = el.giftsInput.value.split("\n").map((v) => v.trim()).filter(Boolean);
+}
+
+function debounce(fn, wait = 300) {
+  let timer = 0;
+  return (...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), wait);
+  };
 }
 
 function render() {
@@ -808,12 +985,19 @@ function initEvents() {
   });
 
   el.saveProfileBtn.addEventListener("click", () => {
-    state.profile.height = el.heightInput.value.trim();
-    state.profile.weight = el.weightInput.value.trim();
-    state.profile.shoe = el.shoeInput.value.trim();
-    state.profile.gifts = el.giftsInput.value.split("\n").map((v) => v.trim()).filter(Boolean);
+    collectProfileFromInputs();
     save();
     alert("孩子信息已保存");
+  });
+
+  const autoSaveProfile = debounce(() => {
+    collectProfileFromInputs();
+    save();
+  }, 350);
+
+  [el.heightInput, el.weightInput, el.shoeInput, el.giftsInput].forEach((input) => {
+    input.addEventListener("input", autoSaveProfile);
+    input.addEventListener("change", autoSaveProfile);
   });
 
   el.likeBtn.addEventListener("click", () => {
@@ -838,14 +1022,30 @@ function initEvents() {
 
   el.fileCategoryFilter.addEventListener("change", renderFiles);
   el.fileSearchInput.addEventListener("input", renderFiles);
+
+  if (el.syncNowBtn) {
+    el.syncNowBtn.addEventListener("click", async () => {
+      if (!state.cloud.enabled) {
+        alert("未配置云同步，请先设置 Supabase 配置。");
+        return;
+      }
+      await cloudSavePayload(composePayload());
+      alert("同步完成");
+    });
+  }
+
+  window.addEventListener("beforeunload", save);
 }
 
-function start() {
-  load();
+async function start() {
+  await load();
+  await requestPersistentStorage();
   initEvents();
   el.calendarMode.value = state.calendarMode;
   state.selectedDate = new Date();
   switchView("today");
+  updateCloudStatus();
 }
 
 start();
+
